@@ -1,522 +1,456 @@
+
+
 import numpy as np
 import cv2
 import argparse
 import sys
+import os
+from scipy import ndimage as ndi
+
+# Try to import numba for JIT compilation (optional, for performance)
+try:
+    from numba import jit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    # Create a no-op decorator if numba is not available
+    def jit(func=None, *args, **kwargs):
+        if func is None:
+            # Called as @jit() - return a decorator
+            def decorator(f):
+                return f
+            return decorator
+        else:
+            # Called as @jit - return function as-is
+            return func
+
+SEAM_COLOR = np.array([255, 200, 200])    # seam visualization color (BGR)
+SHOULD_DOWNSIZE = True                    # if True, downsize image for faster carving
+DOWNSIZE_WIDTH = 500                      # resized image width if SHOULD_DOWNSIZE is True
+ENERGY_MASK_CONST = 100000.0              # large energy value for protective masking
+MASK_THRESHOLD = 10                       # minimum pixel intensity for binary mask
+USE_FORWARD_ENERGY = True                 # if True, use forward energy algorithm                 
 
 
-class ContentAwareImageResizer:
-    def __init__(self, input_file, target_height, target_width, 
-                 protection_mask='', removal_mask=''):
-        #initialize the image resizer with parameters
-        self.input_path = input_file
-        self.target_h = target_height
-        self.target_w = target_width
-        
-        self.source_img = cv2.imread(input_file).astype(np.float64)
-        self.original_h, self.original_w = self.source_img.shape[:2]
-        
-        #initial working img 
-        self.working_img = np.copy(self.source_img)
-        
-        # operation mode determined
-        self.remove_object_mode = (removal_mask != '')
-        
-        if self.remove_object_mode:
-            # Load object removal mask
-            self.protection_map = cv2.imread(removal_mask, 0).astype(np.float64)
-            self.has_protection = False
-        else:
-            self.has_protection = (protection_mask != '')
-            if self.has_protection:
-                self.protection_map = cv2.imread(protection_mask, 0).astype(np.float64)
-        
-        # define convolution kernels for forward energy computation
-        self.horizontal_kernel = np.array([[0., 0., 0.], 
-                                           [-1., 0., 1.], 
-                                           [0., 0., 0.]], dtype=np.float64)
-        
-        self.vertical_left_kernel = np.array([[0., 0., 0.], 
-                                              [0., 0., 1.], 
-                                              [0., -1., 0.]], dtype=np.float64)
-        
-        self.vertical_right_kernel = np.array([[0., 0., 0.], 
-                                               [1., 0., 0.], 
-                                               [0., -1., 0.]], dtype=np.float64)
-        
-        # high weight value for masked regions
-        self.mask_weight = 1000
-        
-        # execute
-        self.execute_processing()
+def visualize(im, boolmask=None, rotate=False):
+    vis = im.astype(np.uint8)
+    if boolmask is not None:
+        vis[np.where(boolmask == False)] = SEAM_COLOR
+    if rotate:
+        vis = rotate_image(vis, False)
+    cv2.imshow("visualization", vis)
+    cv2.waitKey(1)
+    return vis
+
+def resize(image, width):
+    dim = None
+    h, w = image.shape[:2]
+    dim = (width, int(h * width / float(w)))
+    return cv2.resize(image, dim)
+
+def rotate_image(image, clockwise):
+    k = 1 if clockwise else 3
+    return np.rot90(image, k)    
+
+
+
+def backward_energy(im):
+    """
+    Simple gradient magnitude energy map.
+    """
+    # Handle both grayscale and color images
+    if len(im.shape) == 2:
+        # Grayscale image
+        xgrad = ndi.convolve1d(im, np.array([1, 0, -1]), axis=1, mode='wrap')
+        ygrad = ndi.convolve1d(im, np.array([1, 0, -1]), axis=0, mode='wrap')
+        grad_mag = np.sqrt(xgrad**2 + ygrad**2)
+    else:
+        # Color image
+        xgrad = ndi.convolve1d(im, np.array([1, 0, -1]), axis=1, mode='wrap')
+        ygrad = ndi.convolve1d(im, np.array([1, 0, -1]), axis=0, mode='wrap')
+        grad_mag = np.sqrt(np.sum(xgrad**2, axis=2) + np.sum(ygrad**2, axis=2))
+
+    # vis = visualize(grad_mag)
+    # cv2.imwrite("backward_energy_demo.jpg", vis)
+
+    return grad_mag
+
+def forward_energy(im):
     
+    h, w = im.shape[:2]
+    im = cv2.cvtColor(im.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+    energy = np.zeros((h, w))
+    m = np.zeros((h, w))
     
-    def execute_processing(self):
-        if self.remove_object_mode:
-            self.perform_object_removal()
-        else:
-            self.perform_content_aware_resize()
+    U = np.roll(im, 1, axis=0)
+    L = np.roll(im, 1, axis=1)
+    R = np.roll(im, -1, axis=1)
     
+    cU = np.abs(R - L)
+    cL = np.abs(U - L) + cU
+    cR = np.abs(U - R) + cU
     
-    def perform_content_aware_resize(self):
-        """resize image using seam carving in both directions. vertical -> horizontal"""
-        height_diff = int(self.target_h - self.original_h)
-        width_diff = int(self.target_w - self.original_w)
+    for i in range(1, h):
+        mU = m[i-1]
+        mL = np.roll(mU, 1)
+        mR = np.roll(mU, -1)
         
-        # vertical
-        if width_diff < 0:
-            self.remove_vertical_seams(abs(width_diff))
-        elif width_diff > 0:
-            self.insert_vertical_seams(width_diff)
-        
-        # horizontal - rotate
-        if height_diff < 0:
-            self.working_img = self.rotate_image_ccw(self.working_img)
-            if self.has_protection:
-                self.protection_map = self.rotate_mask_ccw(self.protection_map)
-            self.remove_vertical_seams(abs(height_diff))
-            self.working_img = self.rotate_image_cw(self.working_img)
-        elif height_diff > 0:
-            self.working_img = self.rotate_image_ccw(self.working_img)
-            if self.has_protection:
-                self.protection_map = self.rotate_mask_ccw(self.protection_map)
-            self.insert_vertical_seams(height_diff)
-            self.working_img = self.rotate_image_cw(self.working_img)
+        mULR = np.array([mU, mL, mR])
+        cULR = np.array([cU[i], cL[i], cR[i]])
+        mULR += cULR
+
+        argmins = np.argmin(mULR, axis=0)
+        m[i] = np.choose(argmins, mULR)
+        energy[i] = np.choose(argmins, cULR)
     
-    
-    def perform_object_removal(self):
-        """remove object marked by mask and restore original dimensions."""
-        needs_rotation = False
-        obj_h, obj_w = self.calculate_object_bounds()
+    # vis = visualize(energy)
+    # cv2.imwrite("forward_energy_demo.jpg", vis)     
         
-        # rotate if object is wider than tall 
-        if obj_h < obj_w:
-            self.working_img = self.rotate_image_ccw(self.working_img)
-            self.protection_map = self.rotate_mask_ccw(self.protection_map)
-            needs_rotation = True
-        
-        # remove seams through the masked object
-        while np.any(self.protection_map > 0):
-            gradient_map = self.calculate_gradient_energy()
-            # Apply negative weight to prioritize masked pixels
-            gradient_map[self.protection_map > 0] *= -self.mask_weight
-            cost_map = self.build_forward_cost_map(gradient_map)
-            optimal_path = self.trace_minimum_seam(cost_map)
-            self.remove_single_seam(optimal_path)
-            self.remove_seam_from_mask(optimal_path)
-        
-        # calculate pixels 
-        if not needs_rotation:
-            restore_count = self.original_w - self.working_img.shape[1]
-        else:
-            restore_count = self.original_h - self.working_img.shape[1]
-        
-        # restore
-        self.insert_vertical_seams(restore_count)
-        
-        if needs_rotation:
-            self.working_img = self.rotate_image_cw(self.working_img)
-    
-    
-    def remove_vertical_seams(self, seam_count):
-        if self.has_protection:
-            for _ in range(seam_count):
-                gradient_map = self.calculate_gradient_energy()
-                # Increase energy in protected regions
-                gradient_map[self.protection_map > 0] *= self.mask_weight
-                cost_map = self.build_forward_cost_map(gradient_map)
-                optimal_path = self.trace_minimum_seam(cost_map)
-                self.remove_single_seam(optimal_path)
-                self.remove_seam_from_mask(optimal_path)
-        else:
-            for _ in range(seam_count):
-                gradient_map = self.calculate_gradient_energy()
-                cost_map = self.build_forward_cost_map(gradient_map)
-                optimal_path = self.trace_minimum_seam(cost_map)
-                self.remove_single_seam(optimal_path)
-    
-    
-    def insert_vertical_seams(self, seam_count):
-        if self.has_protection:
-            # store original state
-            backup_img = np.copy(self.working_img)
-            backup_mask = np.copy(self.protection_map)
-            seam_registry = []
-            
-            # find seams to insert
-            for _ in range(seam_count):
-                gradient_map = self.calculate_gradient_energy()
-                gradient_map[self.protection_map > 0] *= self.mask_weight
-                cost_map = self.build_backward_cost_map(gradient_map)
-                optimal_path = self.trace_minimum_seam(cost_map)
-                seam_registry.append(optimal_path)
-                self.remove_single_seam(optimal_path)
-                self.remove_seam_from_mask(optimal_path)
-            
-            # restore and insert seams
-            self.working_img = np.copy(backup_img)
-            self.protection_map = np.copy(backup_mask)
-            
-            for _ in range(len(seam_registry)):
-                current_seam = seam_registry.pop(0)
-                self.duplicate_seam(current_seam)
-                self.duplicate_seam_on_mask(current_seam)
-                seam_registry = self.adjust_seam_indices(seam_registry, current_seam)
-        else:
-            # Store original state
-            backup_img = np.copy(self.working_img)
-            seam_registry = []
-            
-            # Find seams to insert
-            for _ in range(seam_count):
-                gradient_map = self.calculate_gradient_energy()
-                cost_map = self.build_backward_cost_map(gradient_map)
-                optimal_path = self.trace_minimum_seam(cost_map)
-                seam_registry.append(optimal_path)
-                self.remove_single_seam(optimal_path)
-            
-            # Restore and insert seams
-            self.working_img = np.copy(backup_img)
-            
-            for _ in range(len(seam_registry)):
-                current_seam = seam_registry.pop(0)
-                self.duplicate_seam(current_seam)
-                seam_registry = self.adjust_seam_indices(seam_registry, current_seam)
-    
-    
-    def calculate_gradient_energy(self):
-        """Compute gradient-based energy map using Scharr operator."""
-        blue_ch, green_ch, red_ch = cv2.split(self.working_img)
-        
-        blue_grad = np.absolute(cv2.Scharr(blue_ch, -1, 1, 0)) + \
-                    np.absolute(cv2.Scharr(blue_ch, -1, 0, 1))
-        
-        green_grad = np.absolute(cv2.Scharr(green_ch, -1, 1, 0)) + \
-                     np.absolute(cv2.Scharr(green_ch, -1, 0, 1))
-        
-        red_grad = np.absolute(cv2.Scharr(red_ch, -1, 1, 0)) + \
-                   np.absolute(cv2.Scharr(red_ch, -1, 0, 1))
-        
-        return blue_grad + green_grad + red_grad
-    
-    
-    def build_backward_cost_map(self, gradient_map):
-        """Build cumulative cost map using backward energy (standard DP)."""
-        rows, cols = gradient_map.shape
-        cost_table = np.copy(gradient_map)
-        
-        for r in range(1, rows):
-            for c in range(cols):
-                left_bound = max(c - 1, 0)
-                right_bound = min(c + 2, cols)
-                cost_table[r, c] = gradient_map[r, c] + \
-                                   np.amin(cost_table[r - 1, left_bound:right_bound])
-        
-        return cost_table
-    
-    
-    def build_forward_cost_map(self, gradient_map):
-        """
-        Build cumulative cost map using forward energy method.
-        Considers pixel differences when removing seams.
-        """
-        horizontal_diff = self.apply_convolution_kernel(self.horizontal_kernel)
-        left_vertical_diff = self.apply_convolution_kernel(self.vertical_left_kernel)
-        right_vertical_diff = self.apply_convolution_kernel(self.vertical_right_kernel)
-        
-        rows, cols = gradient_map.shape
-        cost_table = np.copy(gradient_map)
-        
-        for r in range(1, rows):
-            for c in range(cols):
-                if c == 0:
-                    # left 
-                    right_cost = cost_table[r - 1, c + 1] + \
-                                horizontal_diff[r - 1, c + 1] + \
-                                right_vertical_diff[r - 1, c + 1]
-                    up_cost = cost_table[r - 1, c] + horizontal_diff[r - 1, c]
-                    cost_table[r, c] = gradient_map[r, c] + min(right_cost, up_cost)
-                    
-                elif c == cols - 1:
-                    # right 
-                    left_cost = cost_table[r - 1, c - 1] + \
-                               horizontal_diff[r - 1, c - 1] + \
-                               left_vertical_diff[r - 1, c - 1]
-                    up_cost = cost_table[r - 1, c] + horizontal_diff[r - 1, c]
-                    cost_table[r, c] = gradient_map[r, c] + min(left_cost, up_cost)
-                    
-                else:
-                    # middle columns
-                    left_cost = cost_table[r - 1, c - 1] + \
-                               horizontal_diff[r - 1, c - 1] + \
-                               left_vertical_diff[r - 1, c - 1]
-                    right_cost = cost_table[r - 1, c + 1] + \
-                                horizontal_diff[r - 1, c + 1] + \
-                                right_vertical_diff[r - 1, c + 1]
-                    up_cost = cost_table[r - 1, c] + horizontal_diff[r - 1, c]
-                    cost_table[r, c] = gradient_map[r, c] + \
-                                      min(left_cost, right_cost, up_cost)
-        
-        return cost_table
-    
-    
-    def apply_convolution_kernel(self, filter_kernel):
-        blue_ch, green_ch, red_ch = cv2.split(self.working_img)
-        
-        result = np.absolute(cv2.filter2D(blue_ch, -1, kernel=filter_kernel)) + \
-                 np.absolute(cv2.filter2D(green_ch, -1, kernel=filter_kernel)) + \
-                 np.absolute(cv2.filter2D(red_ch, -1, kernel=filter_kernel))
-        
-        return result
-    
-    
-    def trace_minimum_seam(self, cost_map):
-        rows, cols = cost_map.shape
-        seam_path = np.zeros(rows, dtype=np.uint32)
-        seam_path[-1] = np.argmin(cost_map[-1])
-        
-        # Trace back to top
-        for r in range(rows - 2, -1, -1):
-            previous_col = seam_path[r + 1]
-            
-            if previous_col == 0:
-                # Left boundary
-                seam_path[r] = np.argmin(cost_map[r, :2])
+    return energy
+
+########################################
+# SEAM HELPER FUNCTIONS
+######################################## 
+
+@jit
+def add_seam(im, seam_idx):
+    """
+    Add a vertical seam to a 3-channel color image at the indices provided 
+    by averaging the pixels values to the left and right of the seam.
+
+    Code adapted from https://github.com/vivianhylee/seam-carving.
+    """
+    h, w = im.shape[:2]
+    output = np.zeros((h, w + 1, 3))
+    for row in range(h):
+        col = seam_idx[row]
+        for ch in range(3):
+            if col == 0:
+                p = np.average(im[row, col: col + 2, ch])
+                output[row, col, ch] = im[row, col, ch]
+                output[row, col + 1, ch] = p
+                output[row, col + 1:, ch] = im[row, col:, ch]
             else:
-                # General case
-                left_bound = previous_col - 1
-                right_bound = min(previous_col + 2, cols)
-                seam_path[r] = np.argmin(cost_map[r, left_bound:right_bound]) + left_bound
-        
-        return seam_path
-    
-    
-    def remove_single_seam(self, seam_indices):
-        rows, cols = self.working_img.shape[:2]
-        reduced_img = np.zeros((rows, cols - 1, 3))
-        
-        for r in range(rows):
-            target_col = seam_indices[r]
-            reduced_img[r, :, 0] = np.delete(self.working_img[r, :, 0], target_col)
-            reduced_img[r, :, 1] = np.delete(self.working_img[r, :, 1], target_col)
-            reduced_img[r, :, 2] = np.delete(self.working_img[r, :, 2], target_col)
-        
-        self.working_img = np.copy(reduced_img)
-    
-    
-    def duplicate_seam(self, seam_indices):
-        rows, cols = self.working_img.shape[:2]
-        expanded_img = np.zeros((rows, cols + 1, 3))
-        
-        for r in range(rows):
-            target_col = seam_indices[r]
-            
-            for channel in range(3):
-                if target_col == 0:
-                    # Left edge
-                    avg_value = np.average(self.working_img[r, target_col:target_col + 2, channel])
-                    expanded_img[r, target_col, channel] = self.working_img[r, target_col, channel]
-                    expanded_img[r, target_col + 1, channel] = avg_value
-                    expanded_img[r, target_col + 2:, channel] = self.working_img[r, target_col + 1:, channel]
-                else:
-                    # General case
-                    avg_value = np.average(self.working_img[r, target_col - 1:target_col + 1, channel])
-                    expanded_img[r, :target_col, channel] = self.working_img[r, :target_col, channel]
-                    expanded_img[r, target_col, channel] = avg_value
-                    expanded_img[r, target_col + 1:, channel] = self.working_img[r, target_col:, channel]
-        
-        self.working_img = np.copy(expanded_img)
-    
-    
-    def adjust_seam_indices(self, seam_list, inserted_seam):
-        updated_seams = []
-        
-        for seam in seam_list:
-            # Shift indices that are at or past the inserted seam
-            seam[seam >= inserted_seam] += 2
-            updated_seams.append(seam)
-        
-        return updated_seams
-    
-    
-    def rotate_image_ccw(self, img):
-        rows, cols, channels = img.shape
-        rotated = np.zeros((cols, rows, channels))
-        flipped = np.fliplr(img)
-        
-        for ch in range(channels):
-            for r in range(rows):
-                rotated[:, r, ch] = flipped[r, :, ch]
-        
-        return rotated
-    
-    
-    def rotate_image_cw(self, img):
-        rows, cols, channels = img.shape
-        rotated = np.zeros((cols, rows, channels))
-        
-        for ch in range(channels):
-            for r in range(rows):
-                rotated[:, rows - 1 - r, ch] = img[r, :, ch]
-        
-        return rotated
-    
-    
-    def rotate_mask_ccw(self, mask_array):
+                p = np.average(im[row, col - 1: col + 1, ch])
+                output[row, : col, ch] = im[row, : col, ch]
+                output[row, col, ch] = p
+                output[row, col + 1:, ch] = im[row, col:, ch]
 
-        rows, cols = mask_array.shape
-        rotated = np.zeros((cols, rows))
-        flipped = np.fliplr(mask_array)
-        
-        for r in range(rows):
-            rotated[:, r] = flipped[r, :]
-        
-        return rotated
-    
-    
-    def remove_seam_from_mask(self, seam_indices):
-        """Remove seam from protection mask."""
-        rows, cols = self.protection_map.shape
-        reduced_mask = np.zeros((rows, cols - 1))
-        
-        for r in range(rows):
-            target_col = seam_indices[r]
-            reduced_mask[r, :] = np.delete(self.protection_map[r, :], target_col)
-        
-        self.protection_map = np.copy(reduced_mask)
-    
-    
-    def duplicate_seam_on_mask(self, seam_indices):
-        """Duplicate seam in protection mask."""
-        rows, cols = self.protection_map.shape
-        expanded_mask = np.zeros((rows, cols + 1))
-        
-        for r in range(rows):
-            target_col = seam_indices[r]
-            
-            if target_col == 0:
-                avg_value = np.average(self.protection_map[r, target_col:target_col + 2])
-                expanded_mask[r, target_col] = self.protection_map[r, target_col]
-                expanded_mask[r, target_col + 1] = avg_value
-                expanded_mask[r, target_col + 2:] = self.protection_map[r, target_col + 1:]
+    return output
+
+@jit
+def add_seam_grayscale(im, seam_idx):
+    """
+    Add a vertical seam to a grayscale image at the indices provided 
+    by averaging the pixels values to the left and right of the seam.
+    """    
+    h, w = im.shape[:2]
+    output = np.zeros((h, w + 1))
+    for row in range(h):
+        col = seam_idx[row]
+        if col == 0:
+            p = np.average(im[row, col: col + 2])
+            output[row, col] = im[row, col]
+            output[row, col + 1] = p
+            output[row, col + 1:] = im[row, col:]
+        else:
+            p = np.average(im[row, col - 1: col + 1])
+            output[row, : col] = im[row, : col]
+            output[row, col] = p
+            output[row, col + 1:] = im[row, col:]
+
+    return output
+
+@jit
+def remove_seam(im, boolmask):
+    h, w = im.shape[:2]
+    # Create 3-channel boolean mask without using np.stack (not supported by numba)
+    output = np.zeros((h, w - 1, 3), dtype=im.dtype)
+    for row in range(h):
+        col_idx = 0
+        for col in range(w):
+            if boolmask[row, col]:
+                output[row, col_idx, 0] = im[row, col, 0]
+                output[row, col_idx, 1] = im[row, col, 1]
+                output[row, col_idx, 2] = im[row, col, 2]
+                col_idx += 1
+    return output
+
+@jit
+def remove_seam_grayscale(im, boolmask):
+    h, w = im.shape[:2]
+    output = np.zeros((h, w - 1), dtype=im.dtype)
+    for row in range(h):
+        col_idx = 0
+        for col in range(w):
+            if boolmask[row, col]:
+                output[row, col_idx] = im[row, col]
+                col_idx += 1
+    return output
+
+def get_minimum_seam(im, mask=None, remove_mask=None, use_forward=True):
+    """
+    DP algorithm for finding the seam of minimum energy. Code adapted from 
+    https://karthikkaranth.me/blog/implementing-seam-carving-with-python/
+    """
+    h, w = im.shape[:2]
+    energyfn = forward_energy if use_forward else backward_energy
+    M = energyfn(im)
+
+    if mask is not None:
+        M[np.where(mask > MASK_THRESHOLD)] = ENERGY_MASK_CONST
+
+    # give removal mask priority over protective mask by using larger negative value
+    if remove_mask is not None:
+        M[np.where(remove_mask > MASK_THRESHOLD)] = -ENERGY_MASK_CONST * 100
+
+    backtrack = np.zeros_like(M, dtype=np.int32)
+
+    # populate DP matrix
+    for i in range(1, h):
+        for j in range(0, w):
+            if j == 0:
+                idx = np.argmin(M[i - 1, j:j + 2])
+                backtrack[i, j] = idx + j
+                min_energy = M[i-1, idx + j]
             else:
-                avg_value = np.average(self.protection_map[r, target_col - 1:target_col + 1])
-                expanded_mask[r, :target_col] = self.protection_map[r, :target_col]
-                expanded_mask[r, target_col] = avg_value
-                expanded_mask[r, target_col + 1:] = self.protection_map[r, target_col:]
-        
-        self.protection_map = np.copy(expanded_mask)
-    
-    
-    def calculate_object_bounds(self):
-        """Calculate dimensions of masked object region."""
-        row_coords, col_coords = np.where(self.protection_map > 0)
-        obj_height = np.amax(row_coords) - np.amin(row_coords) + 1
-        obj_width = np.amax(col_coords) - np.amin(col_coords) + 1
-        
-        return obj_height, obj_width
-    
-    
-    def export_result(self, output_filename):
-        """Save the processed image to file."""
-        cv2.imwrite(output_filename, self.working_img.astype(np.uint8))
+                idx = np.argmin(M[i - 1, j - 1:j + 2])
+                backtrack[i, j] = idx + j - 1
+                min_energy = M[i - 1, idx + j - 1]
 
+            M[i, j] += min_energy
+
+    # backtrack to find path
+    seam_idx = []
+    boolmask = np.ones((h, w), dtype=np.bool_)
+    j = np.argmin(M[-1])
+    for i in range(h-1, -1, -1):
+        boolmask[i, j] = False
+        seam_idx.append(j)
+        j = backtrack[i, j]
+
+    seam_idx.reverse()
+    return np.array(seam_idx), boolmask
+
+########################################
+# MAIN ALGORITHM
+######################################## 
+
+def seams_removal(im, num_remove, mask=None, vis=False, rot=False, use_forward=True):
+    for _ in range(num_remove):
+        seam_idx, boolmask = get_minimum_seam(im, mask, None, use_forward)
+        if vis:
+            visualize(im, boolmask, rotate=rot)
+        im = remove_seam(im, boolmask)
+        if mask is not None:
+            mask = remove_seam_grayscale(mask, boolmask)
+    return im, mask
+
+
+def seams_insertion(im, num_add, mask=None, vis=False, rot=False, use_forward=True):
+    seams_record = []
+    temp_im = im.copy()
+    temp_mask = mask.copy() if mask is not None else None
+
+    for _ in range(num_add):
+        seam_idx, boolmask = get_minimum_seam(temp_im, temp_mask, None, use_forward)
+        if vis:
+            visualize(temp_im, boolmask, rotate=rot)
+
+        seams_record.append(seam_idx)
+        temp_im = remove_seam(temp_im, boolmask)
+        if temp_mask is not None:
+            temp_mask = remove_seam_grayscale(temp_mask, boolmask)
+
+    seams_record.reverse()
+
+    for _ in range(num_add):
+        seam = seams_record.pop()
+        im = add_seam(im, seam)
+        if vis:
+            visualize(im, rotate=rot)
+        if mask is not None:
+            mask = add_seam_grayscale(mask, seam)
+
+        # update the remaining seam indices
+        for remaining_seam in seams_record:
+            remaining_seam[np.where(remaining_seam >= seam)] += 2         
+
+    return im, mask
+
+########################################
+# MAIN DRIVER FUNCTIONS
+########################################
+
+def seam_carve(im, dy, dx, mask=None, vis=False, use_forward=True):
+    im = im.astype(np.float64)
+    h, w = im.shape[:2]
+    assert h + dy > 0 and w + dx > 0 and dy <= h and dx <= w
+
+    if mask is not None:
+        mask = mask.astype(np.float64)
+
+    output = im
+
+    if dx < 0:
+        output, mask = seams_removal(output, -dx, mask, vis, use_forward=use_forward)
+
+    elif dx > 0:
+        output, mask = seams_insertion(output, dx, mask, vis, use_forward=use_forward)
+
+    if dy < 0:
+        output = rotate_image(output, True)
+        if mask is not None:
+            mask = rotate_image(mask, True)
+        output, mask = seams_removal(output, -dy, mask, vis, rot=True, use_forward=use_forward)
+        output = rotate_image(output, False)
+
+    elif dy > 0:
+        output = rotate_image(output, True)
+        if mask is not None:
+            mask = rotate_image(mask, True)
+        output, mask = seams_insertion(output, dy, mask, vis, rot=True, use_forward=use_forward)
+        output = rotate_image(output, False)
+
+    return output
+
+
+def object_removal(im, rmask, mask=None, vis=False, horizontal_removal=False, use_forward=True):
+    im = im.astype(np.float64)
+    rmask = rmask.astype(np.float64)
+    if mask is not None:
+        mask = mask.astype(np.float64)
+    output = im
+
+    h, w = im.shape[:2]
+
+    if horizontal_removal:
+        output = rotate_image(output, True)
+        rmask = rotate_image(rmask, True)
+        if mask is not None:
+            mask = rotate_image(mask, True)
+
+    while len(np.where(rmask > MASK_THRESHOLD)[0]) > 0:
+        seam_idx, boolmask = get_minimum_seam(output, mask, rmask, use_forward)
+        if vis:
+            visualize(output, boolmask, rotate=horizontal_removal)            
+        output = remove_seam(output, boolmask)
+        rmask = remove_seam_grayscale(rmask, boolmask)
+        if mask is not None:
+            mask = remove_seam_grayscale(mask, boolmask)
+
+    num_add = (h if horizontal_removal else w) - output.shape[1]
+    output, mask = seams_insertion(output, num_add, mask, vis, rot=horizontal_removal, use_forward=use_forward)
+    if horizontal_removal:
+        output = rotate_image(output, False)
+
+    return output        
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description='Seam Carving - Content-Aware Image Resizing')
+    ap = argparse.ArgumentParser()
     group = ap.add_mutually_exclusive_group(required=True)
-    group.add_argument("-resize", action='store_true', help="Image resize mode")
-    group.add_argument("-remove", action='store_true', help="Object removal mode")
+    group.add_argument("-resize", action='store_true')
+    group.add_argument("-remove", action='store_true')
 
-    ap.add_argument("-im", help="Path to input image", required=True)
+    ap.add_argument("-im", help="Path to image", required=True)
     ap.add_argument("-out", help="Output file name", required=True)
-    ap.add_argument("-mask", help="Path to protective mask (optional)", default='')
-    ap.add_argument("-rmask", help="Path to removal mask (for object removal)", default='')
-    ap.add_argument("-dy", help="Number of rows to add/remove (negative to remove)", type=int, default=0)
-    ap.add_argument("-dx", help="Number of columns to add/remove (negative to remove)", type=int, default=0)
-    
+    ap.add_argument("-mask", help="Path to (protective) mask")
+    ap.add_argument("-rmask", help="Path to removal mask")
+    ap.add_argument("-dy", help="Number of vertical seams to add/subtract", type=int, default=0)
+    ap.add_argument("-dx", help="Number of horizontal seams to add/subtract", type=int, default=0)
+    ap.add_argument("-vis", help="Visualize the seam removal process", action='store_true')
+    ap.add_argument("-hremove", help="Remove horizontal seams for object removal", action='store_true')
+    ap.add_argument("-backward_energy", help="Use backward energy map (default is forward)", action='store_true')
     args = vars(ap.parse_args())
 
-    # Read input image
-    IM_PATH = args["im"]
-    OUTPUT_NAME = args["out"]
-    MASK_PATH = args["mask"]
-    R_MASK_PATH = args["rmask"]
+    IM_PATH, MASK_PATH, OUTPUT_NAME, R_MASK_PATH = args["im"], args["mask"], args["out"], args["rmask"]
+
+    # Normalize path (handle relative paths)
+    IM_PATH = os.path.normpath(IM_PATH)
     
-    # Validate input
-    im = cv2.imread(IM_PATH)
-    if im is None:
-        print(f"Error: Could not load image from {IM_PATH}")
+    # Check if input image exists
+    if not os.path.exists(IM_PATH):
+        print(f"Error: Image file not found: {IM_PATH}")
+        print(f"Current directory: {os.getcwd()}")
+        
+        # Try to suggest similar files
+        if os.path.dirname(IM_PATH):
+            search_dir = os.path.dirname(IM_PATH)
+            if os.path.exists(search_dir):
+                print(f"\nFiles in '{search_dir}':")
+                try:
+                    files = [f for f in os.listdir(search_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+                    if files:
+                        for f in files[:10]:  # Show first 10
+                            print(f"  - {os.path.join(search_dir, f)}")
+                        if len(files) > 10:
+                            print(f"  ... and {len(files) - 10} more")
+                    else:
+                        print("  (no image files found)")
+                except:
+                    pass
+        
+        print(f"\nPlease check the file path and try again.")
         sys.exit(1)
     
-    h, w = im.shape[:2]
-    print(f"Input image: {IM_PATH}")
-    print(f"Original size: {w}x{h}")
+    im = cv2.imread(IM_PATH)
+    if im is None:
+        print(f"Error: Could not read image file: {IM_PATH}")
+        print(f"The file exists but may be corrupted or in an unsupported format.")
+        print(f"Supported formats: JPG, JPEG, PNG, BMP")
+        sys.exit(1)
     
-    # Resize mode
+    # Normalize mask paths
+    if MASK_PATH:
+        MASK_PATH = os.path.normpath(MASK_PATH)
+        if not os.path.exists(MASK_PATH):
+            print(f"Warning: Mask file not found: {MASK_PATH}")
+            MASK_PATH = None
+    
+    if R_MASK_PATH:
+        R_MASK_PATH = os.path.normpath(R_MASK_PATH)
+        if not os.path.exists(R_MASK_PATH):
+            print(f"Warning: Removal mask file not found: {R_MASK_PATH}")
+            R_MASK_PATH = None
+    
+    mask = cv2.imread(MASK_PATH, 0) if MASK_PATH else None
+    if MASK_PATH and mask is None:
+        print(f"Warning: Could not read mask file: {MASK_PATH}")
+        mask = None
+    
+    rmask = cv2.imread(R_MASK_PATH, 0) if R_MASK_PATH else None
+    if R_MASK_PATH and rmask is None:
+        print(f"Warning: Could not read removal mask file: {R_MASK_PATH}")
+        rmask = None
+
+    USE_FORWARD_ENERGY = not args["backward_energy"]
+
+    # downsize image for faster processing
+    h, w = im.shape[:2]
+    if SHOULD_DOWNSIZE and w > DOWNSIZE_WIDTH:
+        im = resize(im, width=DOWNSIZE_WIDTH)
+        if mask is not None:
+            mask = resize(mask, width=DOWNSIZE_WIDTH)
+        if rmask is not None:
+            rmask = resize(rmask, width=DOWNSIZE_WIDTH)
+
+    # image resize mode
     if args["resize"]:
         dy, dx = args["dy"], args["dx"]
-        
-        if dy == 0 and dx == 0:
-            print("Error: Please specify -dy and/or -dx for resize")
-            sys.exit(1)
-        
-        # Calculate target dimensions
-        target_h = h + dy
-        target_w = w + dx
-        
-        if target_h <= 0 or target_w <= 0:
-            print(f"Error: Invalid target dimensions {target_w}x{target_h}")
-            sys.exit(1)
-        
-        print(f"Target size: {target_w}x{target_h}")
-        print(f"Change: {dx:+d} columns, {dy:+d} rows")
-        
-        # Check if we need to add or remove seams
-        if dx > 0 or dy > 0:
-            print("Warning: Seam insertion (enlarging) may produce lower quality results")
-        
-        print("Processing...")
-        
-        # Apply seam carving
-        resizer = ContentAwareImageResizer(
-            IM_PATH,
-            target_h,
-            target_w,
-            protection_mask=MASK_PATH
-        )
-        resizer.export_result(OUTPUT_NAME)
-        
-        # Verify output
-        result = cv2.imread(OUTPUT_NAME)
-        if result is not None:
-            result_h, result_w = result.shape[:2]
-            print(f"✓ Success! Output saved to: {OUTPUT_NAME}")
-            print(f"  Final size: {result_w}x{result_h}")
-        else:
-            print("Error: Failed to save output")
-            sys.exit(1)
-    
-    # Object removal mode
+        assert dy is not None and dx is not None
+        output = seam_carve(im, dy, dx, mask, args["vis"], USE_FORWARD_ENERGY)
+        # Ensure output is uint8 before saving
+        output = np.clip(output, 0, 255).astype(np.uint8)
+        cv2.imwrite(OUTPUT_NAME, output)
+        print(f"✓ Successfully saved result to: {OUTPUT_NAME}")
+
+    # object removal mode
     elif args["remove"]:
-        if not R_MASK_PATH:
-            print("Error: Object removal requires -rmask parameter")
-            sys.exit(1)
-        
-        print(f"Object removal mask: {R_MASK_PATH}")
-        print("Processing...")
-        
-        # Apply object removal
-        resizer = ContentAwareImageResizer(
-            IM_PATH,
-            h,  # Keep original height
-            w,  # Keep original width
-            protection_mask=MASK_PATH,
-            removal_mask=R_MASK_PATH
-        )
-        resizer.export_result(OUTPUT_NAME)
-        
-        print(f"success, output saved to: {OUTPUT_NAME}")
-
-
-
+        assert rmask is not None
+        output = object_removal(im, rmask, mask, args["vis"], args["hremove"], USE_FORWARD_ENERGY)
+        # Ensure output is uint8 before saving
+        output = np.clip(output, 0, 255).astype(np.uint8)
+        cv2.imwrite(OUTPUT_NAME, output)
+        print(f"✓ Successfully saved result to: {OUTPUT_NAME}")

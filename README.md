@@ -10,7 +10,6 @@ This approach enables image retargeting while preserving the integrity of semant
 - **Protection Masks**: Protect important regions (faces, objects) during resizing
 - **Object Removal**: Seamlessly remove unwanted objects from images
 - **Forward Energy**: Uses forward energy method for better quality results
-- **COCO Dataset**
 
 
 ### Installation
@@ -84,104 +83,63 @@ Finds minimum energy path through image:
 - **Protection Masks**: Increase energy to preserve regions
 - **Removal Masks**: Decrease energy to prioritize removal
 
-## COCO Dataset 
 
-### Setup
-```bash
-# Create directories
-mkdir -p images/coco output/coco
+## Batch Process All Images
 
+The optimized `main.py` processes all images in the `input/` directory automatically.
 
-### Process COCO Images
+### Basic Usage
 
 ```bash
-# 1 image
-python main.py -i images/coco/val2017/000000000139.jpg -o output/coco/result.jpg -H 480 -W 640
+# Process all images with default settings (medium size, 70%)
+python main.py
 
-# batch process
-python coco_examples.py --batch
+# Process with small size (50% reduction)
+python main.py --size small
 
-# run 
-python coco_examples.py --demo
+# Process with all sizes (50%, 70%, 80%)
+python main.py --size all
 
-# Create example masks
-python coco_examples.py --mask
+# Process only with standard method (faster)
+python main.py --types standard --no-comparison
+
+# Process only with backward energy
+python main.py --types backward_energy
 ```
 
-## Advanced Usage
 
-### Programmatic API
 
-```python
-from seam_carving import ContentAwareImageResizer
+### Output Structure
 
-# Basic resize
-resizer = ContentAwareImageResizer('input.jpg', target_height=400, target_width=600)
-resizer.export_result('output.jpg')
+output/
+├── standard/          # Forward energy (default method)
+├── backward_energy/   # Backward energy method
+├── with_mask/         # With protection masks (if masks exist)
+└── comparison/        # Side-by-side comparisons
 
-# With protection
-resizer = ContentAwareImageResizer('input.jpg', 400, 600, 
-                                  protection_mask='mask.jpg')
-resizer.export_result('protected_output.jpg')
 
-# Object removal
-resizer = ContentAwareImageResizer('input.jpg', original_h, original_w,
-                                  removal_mask='object.jpg')
-resizer.export_result('cleaned_output.jpg')
-```
 
-### Creating Masks
-
-```python
-import cv2
-import numpy as np
-
-img = cv2.imread('input.jpg')
-h, w = img.shape[:2]
-
-mask = np.zeros((h, w), dtype=np.uint8)
-cv2.rectangle(mask, (100, 100), (300, 300), 255, -1)  
-cv2.circle(mask, (400, 400), 50, 255, -1)            
-
-cv2.imwrite('mask.jpg', mask)
-```
-
-### Testing
+## Web Interface (Streamlit)
 
 ```bash
-# Unit tests with sample images
-python test.py
-
-# Full processing test
-python test.py --quick
-
-# COCO demonstrations
-python coco_examples.py --demo
-```
-
-#### Streamlit 
-### Option 1: Use the Launcher Script
-```bash
-./launch_streamlit.sh
-```
-
-### Option 2: Direct Command
-```bash
-pip install streamlit opencv-python numpy Pillow
 streamlit run app.py
 ```
 
-1. **Upload Section** - Drag & drop your image
-2. **Resize Options** - Choose percentage, exact size, or presets
-3. **Process Button** - Click to apply seam carving
-4. **Results Tabs**:
-   - Seam Carved Result
-   - Comparison with Standard Resize
-   - Side-by-Side View
-5. **Download Buttons** - Save your results
+## 🖥️ Command Line (Single Image)
 
+```bash
+# Resize single image
+python seam_carving.py -resize -im input/beach.jpg -out output/beach_result.jpg -dx -200 -dy 20
 
-**Author**: IT3910E Course Project  
-**Topic**: Seam Carving - Content-Aware Image Resizing  
-**Dataset**: COCO Dataset (Common Objects in Context)
+# With visualization
+python seam_carving.py -resize -im input/beach.jpg -out output/result.jpg -dx -200 -dy 20 -vis
+
+# Object removal
+python seam_carving.py -remove -im input/image.jpg -out output/removed.jpg -rmask masks/object_mask.jpg
+```
+
+---
+
+**Project**: IT3910E - Seam Carving  
+**Optimized for**: Speed and batch processing
 
