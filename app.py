@@ -10,7 +10,8 @@ import time
 from typing import Tuple, Optional
 
 # Import seam carving functions
-from seam_carving import seam_carve
+from seam_carving import seam_carve, HAS_NUMBA
+from greedy import greedy_seam_carve
 
 # ============================================================================
 # CONFIGURATION
@@ -192,7 +193,11 @@ def apply_seam_carving(
     target_height: int,
     protection_mask: np.ndarray = None,
     use_forward_energy: bool = True,
-    progress_callback=None
+    use_greedy: bool = False,
+    progress_callback=None,
+    visualization_callback=None,
+    max_width: int = 2000,
+    show_seam_trace: bool = True
 ) -> np.ndarray:
     """
     Apply seam carving algorithm to resize image.
@@ -201,7 +206,13 @@ def apply_seam_carving(
         image_array: Input image as numpy array (RGB)
         target_width: Desired output width
         target_height: Desired output height
+        protection_mask: Optional protection mask
+        use_forward_energy: Use forward energy (recommended)
+        use_greedy: Use Greedy algorithm (3-5x faster) vs DP (optimal)
         progress_callback: Optional callback for progress updates
+        visualization_callback: Optional callback for visualizing intermediate results
+        max_width: Maximum width for pre-processing downscale (None = no downscale)
+        show_seam_trace: Whether to show red seam traces in visualization (default: True)
         
     Returns:
         Resized image as numpy array (RGB)
@@ -212,16 +223,10 @@ def apply_seam_carving(
     # Get current dimensions
     current_height, current_width = image_bgr.shape[:2]
     
-    # SPEED OPTIMIZATION: Downsize large images (DISABLED for full quality)
-    # Change MAX_WIDTH to control output size:
-    # - 600: Fast processing, lower resolution
-    # - 1200: Balanced quality and speed
-    # - 2000: High quality, slower processing
-    # - 99999: No downsizing, full resolution (slowest)
-    MAX_WIDTH = 99999  # Set to 99999 for no downsizing (full resolution)
+    MAX_WIDTH = max_width
     scale_factor = 1.0
     
-    if current_width > MAX_WIDTH:
+    if MAX_WIDTH is not None and current_width > MAX_WIDTH:
         scale_factor = MAX_WIDTH / current_width
         new_width = MAX_WIDTH
         new_height = int(current_height * scale_factor)
@@ -254,21 +259,63 @@ def apply_seam_carving(
     # Calculate seam changes needed
     dy = target_height - current_height
     dx = target_width - current_width
+    total_seams = abs(dx) + abs(dy)
     
     if progress_callback:
         energy_type = "forward" if use_forward_energy else "backward"
-        progress_callback(0.2, f"Computing {energy_type} energy map...")
+        algo_type = "Greedy (Fast)" if use_greedy else "DP (Optimal)"
+        progress_callback(0.2, f"Using {algo_type} with {energy_type} energy...")
+    
+    # Create step callback for visualization with seam tracing
+    def step_callback(current_step, total_steps, current_image, seam_idx, rotated=False):
+        if visualization_callback:
+            # Create a copy of the image
+            vis_image = np.clip(current_image, 0, 255).astype(np.uint8).copy()
+            
+            # Draw red seam line if enabled (passed via closure)
+            if show_seam_trace:
+                h = vis_image.shape[0]
+                for row in range(h):
+                    col = seam_idx[row]
+                    if 0 <= col < vis_image.shape[1]:
+                        # Draw a thicker line (3 pixels wide) for better visibility
+                        for offset in range(-1, 2):
+                            if 0 <= col + offset < vis_image.shape[1]:
+                                vis_image[row, col + offset] = [255, 0, 0]  # Red color in BGR
+            
+            # Convert BGR to RGB for display
+            current_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+            visualization_callback(current_step, total_steps, current_rgb, rotated)
+        
+        if progress_callback:
+            # Map step progress to 0.2 - 0.8 range
+            progress = 0.2 + (current_step / total_steps) * 0.6
+            progress_callback(progress, f"Processing seam {current_step}/{total_steps}...")
     
     try:
-        # Apply seam carving
-        result_bgr = seam_carve(
-            image_bgr, 
-            dy, 
-            dx, 
-            mask=mask_float, 
-            vis=False, 
-            use_forward=use_forward_energy
-        )
+        # Apply seam carving (DP or Greedy)
+        if use_greedy:
+            # Use Greedy algorithm (3-5x faster but suboptimal)
+            result_bgr = greedy_seam_carve(
+                image_bgr, 
+                dy, 
+                dx, 
+                mask=mask_float, 
+                vis=False, 
+                use_forward=use_forward_energy,
+                step_callback=step_callback if visualization_callback else None
+            )
+        else:
+            # Use Dynamic Programming (optimal but slower)
+            result_bgr = seam_carve(
+                image_bgr, 
+                dy, 
+                dx, 
+                mask=mask_float, 
+                vis=False, 
+                use_forward=use_forward_energy,
+                step_callback=step_callback if visualization_callback else None
+            )
         
         if progress_callback:
             progress_callback(0.8, "Finalizing output...")
@@ -306,7 +353,7 @@ def render_sidebar():
         
         st.markdown("### 📊 About Seam Carving")
         st.info("""
-        Seam carving is an advanced image resizing technique that intelligently 
+        Seam carving is an image resizing technique that automatically
         removes or adds pixels while preserving important image features.
     
         """)
@@ -315,14 +362,18 @@ def render_sidebar():
         
         st.markdown("### ⚙️ Processing Methods")
         
-        # Energy method selection
+        algorithm_choice = st.radio(
+            "Seam Selection Algorithm",
+            ["Dynamic Programming", "Greedy Algorithm"]
+        )
+        
         energy_method = st.radio(
             "Energy Algorithm",
             ["Forward Energy", "Backward Energy"],
         )
         
         # Protection mask upload
-        st.markdown("**Protection Mask (Optional)**")
+        st.markdown("**Protection Mask**")
         protection_mask_file = st.file_uploader(
             "Upload protection mask",
             type=['jpg', 'jpeg', 'png', 'bmp'],
@@ -332,17 +383,48 @@ def render_sidebar():
         
         st.markdown("---")
         
+        
+        disable_downscale = st.checkbox(
+            "Process at Original Size",
+            value=False
+        )
+        
+        if disable_downscale:
+            max_width = None
+        else:
+            max_width = st.slider(
+                "Maximum Processing Width",
+                min_value=400,
+                max_value=3000,
+                value=2000,
+                step=100,
+                help="Larger images are downscaled to this width for faster processing. Increase for better quality on large images."
+            )
+            st.caption(f"⚙️ Images wider than {max_width}px will be downscaled before processing")
+        
+        st.markdown("---")
+        
         st.markdown("### 🛠️ Display Settings")
         show_comparison = st.checkbox("Show standard resize comparison", value=True)
         show_metrics = st.checkbox("Show detailed metrics", value=True)
         show_energy_map = st.checkbox("Show energy map", value=False)
+        show_visualization = st.checkbox("Show real-time visualization", value=True)
+        
+        if show_visualization:
+            show_seam_trace = st.checkbox("Show red seam traces", value=True)
+        else:
+            show_seam_trace = False
         
         return {
             'show_comparison': show_comparison,
             'show_metrics': show_metrics,
             'show_energy_map': show_energy_map,
-            'use_forward_energy': energy_method == "Forward Energy (Recommended)",
-            'protection_mask': protection_mask_file
+            'show_visualization': show_visualization,
+            'show_seam_trace': show_seam_trace,
+            'use_forward_energy': energy_method == "Forward Energy",
+            'protection_mask': protection_mask_file,
+            'use_greedy': "Greedy" in algorithm_choice,
+            'max_width': max_width
         }
 
 def render_header():
@@ -452,7 +534,7 @@ def render_resize_controls(original_width: int, original_height: int):
     
     # Show preview of target dimensions
     st.markdown("---")
-    st.subheader("📐 Target Dimensions")
+    st.subheader("Target Dimensions")
     
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -478,28 +560,27 @@ def render_resize_controls(original_width: int, original_height: int):
 
 def render_results(original, result, settings):
     """Render processing results."""
-    st.header("📊 Results")
-    
-    # Show saved file location if available
+    st.header("Results")
+ 
     if 'output_path' in st.session_state:
         st.success(f"Auto-saved to: `{st.session_state.output_path}`")
     
-    # Create tabs for different views
-    tab_list = ["✨ Seam Carved", "🔍 Comparison", "📸 Side-by-Side"]
+
+    tab_list = ["Seam Carved", "Comparison", "Side-by-Side"]
     if settings.get('show_energy_map', False):
-        tab_list.append("🔥 Energy Map")
+        tab_list.append("Energy Map")
     
     tabs = st.tabs(tab_list)
     
     with tabs[0]:
-        st.subheader("Seam Carved Result")
+        st.subheader("Seam Carved")
         st.image(result, width='stretch')
         
         result_h, result_w = result.shape[:2]
         
         col1, col2 = st.columns(2)
         with col1:
-            st.info(f"**Final Size:** {result_w} × {result_h} pixels")
+            st.info(f"Final Size: {result_w} × {result_h} pixels")
         with col2:
             # Download button
             result_pil = Image.fromarray(result)
@@ -507,7 +588,7 @@ def render_results(original, result, settings):
             result_pil.save(buf, format='JPEG', quality=95)
             
             st.download_button(
-                label="📥 Download Result",
+                label="Download Result",
                 data=buf.getvalue(),
                 file_name=f"seam_carved_{result_w}x{result_h}.jpg",
                 mime="image/jpeg"
@@ -515,7 +596,7 @@ def render_results(original, result, settings):
     
     with tabs[1]:
         if settings['show_comparison']:
-            st.subheader("Comparison: Seam Carving vs Standard Resize")
+            st.subheader("Comparison")
             
             # Create standard resize
             standard = standard_resize(original, result.shape[1], result.shape[0])
@@ -523,42 +604,41 @@ def render_results(original, result, settings):
             col1, col2 = st.columns(2)
             
             with col1:
-                st.markdown("**Standard Resize (Distorted)**")
+                st.markdown("Standard Resize")
                 st.image(standard, width='stretch')
             
             with col2:
-                st.markdown("**Seam Carving (Content-Aware)**")
+                st.markdown("Seam Carving")
                 st.image(result, width='stretch')
             
         else:
-            st.info("Enable 'Show standard resize comparison' in the sidebar to see comparison.")
+            st.info("Enable 'Show standard resize comparison' to see comparison.")
     
     with tabs[2]:
-        st.subheader("Side-by-Side Comparison")
+        st.subheader("Side-by-Side")
         
         orig_h, orig_w = original.shape[:2]
         result_h, result_w = result.shape[:2]
         
-        st.info(f"**Original:** {orig_w}×{orig_h} pixels  |  **Result:** {result_w}×{result_h} pixels")
+        st.info(f"Original: {orig_w}×{orig_h} pixels  |  Result: {result_w}×{result_h} pixels")
         
         col1, col2 = st.columns([orig_w, result_w])
         
         with col1:
-            st.markdown(f"**Original ({orig_w}×{orig_h})**")
+            st.markdown(f"Original ({orig_w}×{orig_h})")
             st.image(original)
         
         with col2:
-            st.markdown(f"**Seam Carved ({result_w}×{result_h})**")
+            st.markdown(f"Seam Carved ({result_w}×{result_h})")
             st.image(result)
     
-    # Energy Map Tab (if enabled)
     if settings.get('show_energy_map', False) and len(tabs) > 3:
         with tabs[3]:
-            st.subheader("🔥 Energy Map Visualization")
+            st.subheader("Energy Map")
             st.info("""
             The energy map shows pixel importance:
-            - **Bright areas**: High energy (important features, edges)
-            - **Dark areas**: Low energy (less important, will be removed first)
+            - Bright areas: High energy (important features, edges)
+            - Dark areas: Low energy (less important, will be removed first)
             """)
             
             # Calculate and show energy map
@@ -580,96 +660,20 @@ def render_results(original, result, settings):
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.markdown("**Original Image**")
+                    st.markdown("Original Image")
                     st.image(original, width='stretch')
                 with col2:
-                    st.markdown("**Energy Map (Heatmap)**")
+                    st.markdown("Energy Map (Heatmap)")
                     st.image(energy_rgb, width='stretch')
                 
             except Exception as e:
                 st.error(f"Could not generate energy map: {str(e)}")
 
-def render_instructions():
-    """Render instructions when no image is uploaded."""
-    st.info("👆 **Get Started:** Upload an image above to begin")
-    
-    st.markdown("---")
-    st.header("💡 How to Use This Application")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("### 1️⃣ Upload")
-        st.markdown("""
-        - Click the upload button
-        - Select your image
-        - Supported: JPG, PNG, BMP
-        - Recommended: 800-2000px wide
-        """)
-    
-    with col2:
-        st.markdown("### 2️⃣ Configure")
-        st.markdown("""
-        - Choose resize method
-        - Set target dimensions
-        - Preview changes
-        - Adjust as needed
-        """)
-    
-    with col3:
-        st.markdown("### 3️⃣ Process")
-        st.markdown("""
-        - Click 'Start Processing'
-        - Wait for processing
-        - View results
-        - Download output
-        """)
-    
-    st.markdown("---")
-    
-    st.header("🔬 Algorithm Overview")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("### Forward Energy Method")
-        st.markdown("""
-        This implementation uses the **forward energy** algorithm, which:
-        
-        1. Analyzes pixel importance using gradient-based energy
-        2. Identifies optimal seams (connected paths of low-energy pixels)
-        3. Removes/Adds seams to resize the image
-        4. Preserves important visual features and structures
-        
-        The forward energy method considers the cost of creating new edges 
-        when removing pixels, resulting in better quality than backward energy.
-        """)
-    
-    with col2:
-        st.markdown("### Technical Details")
-        st.markdown("""
-        **Implementation:**
-        - Language: Python 3.10+
-        - Libraries: NumPy, OpenCV, SciPy, Numba
-        - Algorithm: Forward Energy Seam Carving
-        - Optimization: JIT compilation with Numba
-        
-        **Performance:**
-        - Processes 500×375 image in ~5-10 seconds
-        - Scales linearly with image size
-        - Memory efficient implementation
-        """)
-
 def render_footer():
     """Render application footer."""
-    st.markdown("---")
     st.markdown("""
         <div class='footer'>
-            <p><strong>IT3910E - Project 1: Seam Carving</strong></p>
-            <p>Content-Aware Image Resizing | Built with Streamlit & Python</p>
-            <p style='font-size: 12px; color: #999; margin-top: 10px;'>
-                © 2024 IT3910E Course Project
-            </p>
+            <p>IT3910E - Project 1: Seam Carving</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -746,6 +750,17 @@ def main():
         
         st.markdown("---")
         
+        # Show actual output dimensions info
+        if settings['max_width'] is None:
+            st.success(f"Exact Output:  {target_width}×{target_height} pixels")
+        elif img_info['width'] > settings['max_width']:
+            scale_factor = settings['max_width'] / img_info['width']
+            actual_output_w = int(target_width * scale_factor)
+            actual_output_h = int(target_height * scale_factor)
+            
+            st.warning(f"⚠️ **Your output will be ~{actual_output_w}×{actual_output_h} pixels** (NOT {target_width}×{target_height})")
+            st.info(f"🔽 Image is being downscaled from {img_info['width']}px to {settings['max_width']}px for faster processing")
+        
         # Process button
         if st.button("Starting Processing", type="primary"):
             # Validate dimensions
@@ -757,9 +772,36 @@ def main():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
+                # Visualization placeholder
+                visualization_placeholder = None
+                visualization_info = None
+                
+                if settings['show_visualization']:
+                    st.markdown("---")
+                    st.subheader("🎬 Real-Time Processing Visualization")
+                    visualization_info = st.empty()
+                    visualization_placeholder = st.empty()
+                
                 def update_progress(value, message):
                     progress_bar.progress(value)
                     status_text.text(message)
+                
+                # Track when to update visualization (update every N seams to avoid slowdown)
+                last_update_step = [0]  # Use list to allow modification in nested function
+                UPDATE_INTERVAL = 5  # Update every 5 seams
+                
+                def visualization_callback(current_step, total_steps, current_image, rotated=False):
+                    """Update visualization every few steps with optional red seam trace"""
+                    if visualization_placeholder and (current_step - last_update_step[0] >= UPDATE_INTERVAL or current_step == total_steps):
+                        last_update_step[0] = current_step
+                        h, w = current_image.shape[:2]
+                        
+                        orientation = " (processing vertically)" if rotated else ""
+                        info_text = f"**Progress**: Seam {current_step}/{total_steps} | Current size: **{w}×{h}** pixels{orientation}"
+                        
+                        
+                        visualization_info.markdown(info_text)
+                        visualization_placeholder.image(current_image, use_container_width=True)
                 
                 try:
                     # Start timer
@@ -769,9 +811,10 @@ def main():
                     update_progress(0.1, "Initializing...")
                     
                     # Show processing method
-                    method_name = "Forward Energy" if settings['use_forward_energy'] else "Backward Energy"
+                    algo_name = "Greedy (3-5x Faster)" if settings['use_greedy'] else "Dynamic Programming"
+                    energy_name = "Forward Energy" if settings['use_forward_energy'] else "Backward Energy"
                     mask_status = " + Protection Mask" if protection_mask is not None else ""
-                    st.info(f"🔧 Processing with: **{method_name}{mask_status}**")
+                    st.info(f"Algorithm: {algo_name} | Energy: {energy_name}{mask_status}")
                     
                     result = apply_seam_carving(
                         image_array,
@@ -779,7 +822,11 @@ def main():
                         target_height,
                         protection_mask=protection_mask,
                         use_forward_energy=settings['use_forward_energy'],
-                        progress_callback=update_progress
+                        use_greedy=settings['use_greedy'],
+                        progress_callback=update_progress,
+                        visualization_callback=visualization_callback if settings['show_visualization'] else None,
+                        max_width=settings['max_width'],
+                        show_seam_trace=settings['show_seam_trace']
                     )
                     
                     # Calculate processing time
@@ -835,8 +882,14 @@ def main():
                     progress_bar.empty()
                     status_text.empty()
                     
+                    # Clear visualization placeholders
+                    if visualization_placeholder:
+                        visualization_placeholder.empty()
+                    if visualization_info:
+                        visualization_info.empty()
+                    
                     # Success message with save location
-                    st.success(f"Processing complete, (Time: {processing_time:.2f}s)")
+                    st.success(f"Time: {processing_time:.2f}s")
                     st.info(f"Saved to: `{output_path}`")
                     
                     # Store result in session state
@@ -846,7 +899,7 @@ def main():
                     st.session_state.output_path = output_path
                     
                 except Exception as e:
-                    st.error(f"❌ Error during processing: {str(e)}")
+                    st.error(f"Error during processing: {str(e)}")
                     import traceback
                     with st.expander("Show error details"):
                         st.code(traceback.format_exc())
@@ -877,7 +930,7 @@ def main():
     
     else:
         # Show instructions when no image is uploaded
-        render_instructions()
+        st.info("Get Started")
     
     # Render footer
     render_footer()
